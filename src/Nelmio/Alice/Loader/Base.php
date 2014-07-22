@@ -11,6 +11,7 @@
 
 namespace Nelmio\Alice\Loader;
 
+use Doctrine\Common\Collections\ArrayCollection;
 use Symfony\Component\Form\Util\FormUtil;
 use Symfony\Component\PropertyAccess\StringUtil;
 use Psr\Log\LoggerInterface;
@@ -121,12 +122,9 @@ class Base implements LoaderInterface
             // $loader is defined to give access to $loader->fake() in the included file's context
             $loader = $this;
             $filename = $data;
-            if (!file_exists($filename)) {
-                throw new \InvalidArgumentException('The file could not be found: '.$filename);
-            }
             $includeWrapper = function () use ($filename, $loader) {
                 ob_start();
-                $res = require $filename;
+                $res = include $filename;
                 ob_end_clean();
 
                 return $res;
@@ -289,6 +287,17 @@ class Base implements LoaderInterface
 
     protected function createInstance($class, $name, array &$data)
     {
+        $newInstanceWithoutConstructor = function ($class) {
+            if (version_compare(PHP_VERSION, '5.4', '<')) {
+                // unserialize hack for php <5.4
+                return unserialize(sprintf('O:%d:"%s":0:{}', strlen($class), $class));
+            }
+
+            $reflClass = new \ReflectionClass($class);
+
+            return $reflClass->newInstanceWithoutConstructor();
+        };
+
         try {
             // constructor is defined explicitly
             if (isset($data['__construct'])) {
@@ -297,14 +306,7 @@ class Base implements LoaderInterface
 
                 // constructor override
                 if (false === $args) {
-                    if (version_compare(PHP_VERSION, '5.4', '<')) {
-                        // unserialize hack for php <5.4
-                        return $this->references[$name] = unserialize(sprintf('O:%d:"%s":0:{}', strlen($class), $class));
-                    }
-
-                    $reflClass = new \ReflectionClass($class);
-
-                    return $this->references[$name] = $reflClass->newInstanceWithoutConstructor();
+                    return $this->references[$name] = $newInstanceWithoutConstructor($class);
                 }
 
                 /**
@@ -338,6 +340,11 @@ class Base implements LoaderInterface
                 }
 
                 if ($constructor === '__construct') {
+                    $reflConstruct = $reflClass->getMethod($constructor);
+                    if (!$reflConstruct->isPublic()) {
+                        throw new \UnexpectedValueException("The constructor is private, use the factory function provided in the entity or make it public.");
+                    }
+
                     $instance = $reflClass->newInstanceArgs($args);
                 } else {
                     $instance = forward_static_call_array(array($class, $constructor), $args);
@@ -350,15 +357,23 @@ class Base implements LoaderInterface
             }
 
             // call the constructor if it contains optional params only
-            $reflMethod = new \ReflectionMethod($class, '__construct');
-            if (0 === $reflMethod->getNumberOfRequiredParameters()) {
-                return $this->references[$name] = new $class();
+            $reflClass = new \ReflectionClass($class);
+            if (!$reflConstructor = $reflClass->getConstructor()) {
+                return $this->references[$name] = $newInstanceWithoutConstructor($class);
+            }
+
+            if ($reflConstructor->getNumberOfRequiredParameters() === 0) {
+                if ($reflConstructor->isPublic()) {
+                    return $this->references[$name] = new $class;
+                } else {
+                    return $this->references[$name] = $newInstanceWithoutConstructor($class);
+                }
             }
 
             // exception otherwise
             throw new \RuntimeException('You must specify a __construct method with its arguments in object '.$name.' since class '.$class.' has mandatory constructor arguments');
         } catch (\ReflectionException $exception) {
-            return $this->references[$name] = new $class();
+            return $this->references[$name] = new $class;
         }
     }
 
@@ -610,7 +625,7 @@ class Base implements LoaderInterface
             }, $args);
 
             // replace references to other objects
-            $args = preg_replace_callback('{(?<string>".*?[^\\\\]")|(?:(?<multi>\d+)x )?(?<!\\\\)@(?<reference>[a-z0-9_.*]+)(?:\->(?<property>[a-z0-9_-]+))?}i', function ($match) use ($that, $args) {
+            $args = preg_replace_callback('{(?<string>".*?[^\\\\]")|(?:(?<multi>\d+)x )?(?<!\\\\)@(?<reference>[a-z0-9_.*]+)(\{(?<repetition_from>\d+)..(?<repetition_to>\d+)\})?(?:\->(?<property>[a-z0-9_-]+))?}i', function ($match) use ($that, $args) {
 
                 if (!empty($match['string'])) {
                     return $match['string'];
@@ -618,6 +633,25 @@ class Base implements LoaderInterface
 
                 $multi    = ('' !== $match['multi']) ? $match['multi'] : null;
                 $property = isset($match['property']) ? $match['property'] : null;
+
+                if (isset($match['repetition_from'])) {
+                    $from = $match['repetition_from'];
+                    $to = $match['repetition_to'];
+                    $reference = $match['reference'];
+                    $references = array();
+                    $referenceCommand = '$that->getReference(%s, %s)';
+
+                    foreach (range($from, $to) as $ptr) {
+                        $references[] = sprintf(
+                            $referenceCommand,
+                            var_export($match['reference'] . $ptr, true),
+                            var_export($property, true)
+                        );
+                    }
+
+                    return sprintf('array(%s)', implode(',', $references));
+                }
+
                 if (strpos($match['reference'], '*')) {
                     return '$that->getRandomReferences(' . var_export($match['reference'], true) . ', ' . var_export($multi, true) . ', ' . var_export($property, true) . ')';
                 }
@@ -629,6 +663,17 @@ class Base implements LoaderInterface
 
             $locale = var_export($matches['locale'], true);
             $name = var_export($matches['name'], true);
+
+            $trimName = trim($name, "'");
+            if ($trimName == 'ArrayCollection' && class_exists('\Doctrine\Common\Collections\ArrayCollection')) {
+                $element = eval('return ' .$args . ';'); // eval.. not cool :(
+                if (is_array($element)) {
+                    $coll = new ArrayCollection($element);
+                } else {
+                    $coll = new ArrayCollection(array($element));
+                }
+                return $coll;
+            }
 
             return eval('return $that->fake(' . $name . ', ' . $locale . ', ' . $args . ');');
         };
@@ -654,6 +699,7 @@ class Base implements LoaderInterface
                 if (null !== $multi) {
                     throw new \UnexpectedValueException('To use multiple references you must use a mask like "'.$matches['multi'].'x @user*", otherwise you would always get only one item.');
                 }
+
                 $data = $this->getReference($matches['reference'], $property);
             }
         }
@@ -740,7 +786,7 @@ class Base implements LoaderInterface
         $this->logger = $logger;
     }
 
-   /**
+    /**
      * Logs a message using the logger.
      *
      * @param string $message
